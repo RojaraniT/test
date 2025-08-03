@@ -1,0 +1,1730 @@
+import {
+  getPageInfo,
+  formatTranscriptDataWithOutTS,
+  formatTranscriptDataWithTimestamps,
+} from './helpers/common';
+import { state, updateTranscriptData, updateTranscriptId } from './helpers/state';
+import { Readability } from '@mozilla/readability';
+
+// Clear "disable this time" flag on page load to ensure it only lasts until refresh
+try {
+  sessionStorage.removeItem('aiglite_toolbar_disabled_once');
+} catch (error) {
+  console.warn('AIG Lite: SessionStorage not available:', error);
+}
+
+// Helper function to check if Chrome APIs are available
+function isChromeApiAvailable() {
+  try {
+    return typeof chrome !== 'undefined' && 
+           chrome.storage && 
+           chrome.storage.local && 
+           typeof chrome.storage.local.get === 'function';
+  } catch (error) {
+    return false;
+  }
+}
+
+// Helper function to log toolbar events to service
+function logToolbarEvent(eventName, additionalData = {}) {
+  if (!isChromeApiAvailable()) {
+    console.warn('AIG Lite: Chrome APIs not available, cannot log event:', eventName);
+    return;
+  }
+  
+  try {
+    chrome.runtime.sendMessage({
+      action: 'logToService',
+      logData: {
+        event: eventName,
+        url: window.location.href,
+        title: document.title,
+        domain: window.location.hostname.replace(/^www\./, ''),
+        timestamp: Date.now(),
+        ...additionalData
+      },
+    });
+  } catch (error) {
+    console.warn('AIG Lite: Error logging toolbar event:', error);
+  }
+}
+
+// Helper function to show notification about re-enabling in options
+function showOptionsPageNotification(message) {
+  // Check if notification has already been shown for this site
+  const notificationKey = `aig-lite-notification-shown-${window.location.hostname}`;
+  
+  try {
+    if (localStorage.getItem(notificationKey)) {
+      console.log('AIG Lite: Notification already shown for this site');
+      return; // Don't show notification again
+    }
+  } catch (error) {
+    console.warn('AIG Lite: Could not access localStorage:', error);
+    // Continue to show notification if localStorage fails
+  }
+
+  // Remove any existing notification first
+  const existingNotification = document.getElementById('aig-lite-options-notification');
+  if (existingNotification) {
+    existingNotification.remove();
+  }
+
+  const notification = document.createElement('div');
+  notification.id = 'aig-lite-options-notification';
+  
+  let hideTimer = null;
+  let isHovered = false;
+
+  notification.innerHTML = `
+    <div style="
+      position: fixed !important;
+      top: 20px !important;
+      right: 20px !important;
+      background: white !important;
+      color: #111827 !important;
+      padding: 12px 16px !important;
+      border-radius: 8px !important;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15), 0 0 0 1px rgba(0, 0, 0, 0.05) !important;
+      z-index: 2147483647 !important;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+      font-size: 11px !important;
+      line-height: 1.4 !important;
+      max-width: 280px !important;
+      pointer-events: auto !important;
+      transform: translateX(100%) !important;
+      transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+      border: none !important;
+      margin: 0 !important;
+      opacity: 1 !important;
+    ">
+      <div style="
+        display: flex !important;
+        align-items: flex-start !important;
+        justify-content: space-between !important;
+        gap: 8px !important;
+      ">
+        <div style="flex: 1 !important;">
+          <div style="font-weight: 600 !important; margin-bottom: 4px !important; font-size: 11px !important; color: #111827 !important;">AIG Lite</div>
+          <div style="color: #374151 !important; font-size: 11px !important;">
+            To re-enable, right-click on AIG Lite extension icon 
+            <img src="${chrome.runtime.getURL('icon.png')}" style="
+              width: 12px !important; 
+              height: 12px !important; 
+              vertical-align: middle !important; 
+              margin: 0 2px !important;
+            " alt="AIG Lite"> 
+            above and select Options.
+          </div>
+        </div>
+        <button id="aig-lite-notification-close" style="
+          background: none !important;
+          border: none !important;
+          color: #6b7280 !important;
+          cursor: pointer !important;
+          padding: 0 !important;
+          font-size: 16px !important;
+          line-height: 1 !important;
+          flex-shrink: 0 !important;
+          width: 20px !important;
+          height: 20px !important;
+          display: flex !important;
+          align-items: center !important;
+          justify-content: center !important;
+          border-radius: 4px !important;
+        ">×</button>
+      </div>
+    </div>
+  `;
+
+  // Append to body to avoid any container issues
+  document.body.appendChild(notification);
+
+  // Mark notification as shown for this site
+  try {
+    localStorage.setItem(notificationKey, Date.now().toString());
+  } catch (error) {
+    console.warn('AIG Lite: Could not save notification state:', error);
+  }
+
+  // Get references to elements after they're in the DOM
+  const notificationContent = notification.firstElementChild;
+  const closeButton = notification.querySelector('#aig-lite-notification-close');
+
+  // Set up close button functionality
+  closeButton.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    clearTimeout(hideTimer);
+    notification.remove();
+  });
+
+  // Close button hover effects
+  closeButton.addEventListener('mouseenter', () => {
+    closeButton.style.color = '#374151';
+    closeButton.style.backgroundColor = '#f3f4f6';
+  });
+
+  closeButton.addEventListener('mouseleave', () => {
+    closeButton.style.color = '#6b7280';
+    closeButton.style.backgroundColor = 'transparent';
+  });
+
+  // Function to start hide timer
+  function startHideTimer() {
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {
+      if (!isHovered && notification && notification.parentNode) {
+        // Animate out
+        notificationContent.style.transform = 'translateX(100%)';
+        
+        // Remove from DOM after animation completes
+        setTimeout(() => {
+          if (notification && notification.parentNode) {
+            notification.remove();
+          }
+        }, 300);
+      }
+    }, 5000);
+  }
+
+  // Hover functionality for the entire notification
+  notification.addEventListener('mouseenter', () => {
+    isHovered = true;
+    clearTimeout(hideTimer);
+  });
+
+  notification.addEventListener('mouseleave', () => {
+    isHovered = false;
+    startHideTimer();
+  });
+
+  // Force reflow and then animate in
+  notification.offsetHeight;
+  notificationContent.style.transform = 'translateX(0)';
+
+  // Start initial hide timer
+  startHideTimer();
+}
+
+let lastDetectedToastId = null;
+// Domain configurations for upload error detection
+const DOMAIN_CONFIGS = {
+  'claude.ai': {
+    // Remove unsupported selectors, use only for reference
+    uploadButtonSelectors: [], // Not used, see findUploadButton
+    errorSelectors: [], // Not used, see checkForUploadErrors
+    errorTextMatches: [
+      'Text extraction failed for one of the uploaded files',
+      'Please try again',
+      'upload failed',
+      'failed to upload',
+      'extraction failed',
+      'could not upload',
+    ],
+    popupPosition: 'below-button',
+  },
+  'chatgpt.com': {
+    uploadButtonSelectors: [],
+    errorSelectors: [],
+    errorTextMatches: [
+      'Failed upload to files.oaiusercontent.com',
+      'Please ensure your network settings allow access to this site',
+      'contact your network administrator',
+      'upload failed',
+    ],
+    popupPosition: 'below-button',
+  },
+};
+
+// Track if popup is already shown to prevent duplicates
+let aigLitePopupShown = false;
+let popupCleanupTimeout = null;
+
+function removeTags(html) {
+  // Create a parser and new document
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+
+  // Get text content safely
+  return doc.body.textContent || doc.body.innerText || '';
+}
+
+function processArticle(document) {
+  // Create a clone of the document to avoid modifying the live DOM
+  const documentClone = document.cloneNode(true);
+
+  // Create new Readability instance with the clone
+  let reader = new Readability(documentClone);
+  let article = reader.parse();
+
+  let content = removeTags(article.content);
+
+  // Extract metadata
+  const metadata = {
+    title: article.title,
+    byline: article.byline,
+    length: article.length,
+    excerpt: article.excerpt,
+    siteName: article.siteName,
+  };
+
+  return {
+    content,
+    metadata,
+  };
+}
+
+function removeFloatingButton() {
+  const oldBtn = document.getElementById('aig-lite-toolbar');
+  if (oldBtn) oldBtn.remove();
+
+  // Clean up any remaining tooltips
+  const tooltips = document.querySelectorAll(
+    'div[style*="position: fixed"][style*="background: rgb(24, 24, 27)"]'
+  );
+  tooltips.forEach((tooltip) => {
+    // Check if it looks like our tooltip style
+    if (
+      tooltip.style.color === 'rgb(255, 255, 255)' &&
+      tooltip.style.fontSize === '12px' &&
+      tooltip.style.fontWeight === '500'
+    ) {
+      tooltip.remove();
+    }
+  });
+}
+
+function removeFloatingDot() {
+  const dot = document.getElementById('aig-lite-toolbar-dot');
+  if (dot) dot.remove();
+}
+
+function showFloatingDot(rect, selectedText) {
+  removeFloatingButton();
+  removeFloatingDot();
+
+  const dot = document.createElement('div');
+  dot.id = 'aig-lite-toolbar-dot';
+  Object.assign(dot.style, {
+    position: 'fixed',
+    top: `${rect.top + window.scrollY - 14}px`,
+    left: `${rect.left + window.scrollX - 4}px`,
+    width: '8px',
+    height: '8px',
+    background: '#3b82f6',
+    borderRadius: '50%',
+    zIndex: 9999,
+    boxShadow: '0 1px 4px rgba(0,0,0,0.13)',
+    cursor: 'pointer',
+    transition: 'background 0.2s'
+  });
+
+  dot.onmouseenter = () => {
+    dot.style.background = '#2563eb';
+    // Show the toolbar after a short delay for better UX
+    setTimeout(() => {
+      // removeFloatingDot();
+      showFloatingButton(dot.getBoundingClientRect(), selectedText);
+    }, 0);
+  };
+  dot.onmouseleave = (event) => {
+    dot.style.background = '#3b82f6';
+    console.log('event', event.relatedTarget)
+    //  if (!event.relatedTarget || !event.relatedTarget.closest('#aig-lite-toolbar')) {
+    //   removeFloatingButton();
+    // }
+  };
+
+  document.body.appendChild(dot);
+}
+
+// Modern horizontal toolbar for selected text
+function showFloatingButton(rect, selectedText) {
+  removeFloatingButton();
+  console.log('showFloatingButton', rect.top, rect.left)
+  // Create main toolbar container
+  const container = document.createElement('div');
+  container.id = 'aig-lite-toolbar';
+  Object.assign(container.style, {
+    position: 'fixed',
+    top: `${rect.top + window.scrollY - 20}px`, // show above selection, less offset
+    left: `${rect.left + window.scrollX + 20}px`,
+    zIndex: 9999,
+    display: 'flex',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: '2px',
+    background: 'white',
+    borderRadius: '10px',
+    boxShadow: '0 2px 8px rgba(0,0,0,0.13), 0 0 0 1px #eee',
+    minHeight: '28px',
+    height: '28px',
+    border: '1px solid #e0e0e0',
+    transition: 'all 0.2s cubic-bezier(.4,0,.2,1)',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    userSelect: 'none',
+  });
+
+  container.onmouseleave = () => {
+    removeFloatingButton();
+  }
+
+  // --- Logo Button (clickable, opens side panel) ---
+  const logoBtn = document.createElement('button');
+  logoBtn.setAttribute('aria-label', 'Open AIG Lite');
+  logoBtn.style.display = 'flex';
+  logoBtn.style.alignItems = 'center';
+  logoBtn.style.justifyContent = 'center';
+  logoBtn.style.width = '28px';
+  logoBtn.style.height = '28px';
+  logoBtn.style.minWidth = '28px';
+  logoBtn.style.minHeight = '28px';
+  logoBtn.style.borderRadius = '7px';
+  logoBtn.style.background = 'transparent';
+  logoBtn.style.marginRight = '2px';
+  logoBtn.style.border = 'none';
+  logoBtn.style.cursor = 'pointer';
+  logoBtn.style.transition = 'background 0.15s';
+  logoBtn.onmouseover = () => (logoBtn.style.background = '#f3f3f3');
+  logoBtn.onmouseout = () => (logoBtn.style.background = 'transparent');
+  const logoImg = document.createElement('img');
+  logoImg.src = chrome.runtime.getURL('icon.png');
+  logoImg.alt = 'AIG Lite';
+  logoImg.style.width = '16px';
+  logoImg.style.height = '16px';
+  logoBtn.appendChild(logoImg);
+
+  // Tooltip for logo button
+  let logoTooltip;
+  logoBtn.addEventListener('mouseenter', () => {
+    logoTooltip = document.createElement('div');
+    // Detect platform for Option/Alt symbol
+    let shortcut = '';
+    if (navigator.platform.toLowerCase().includes('mac')) {
+      shortcut = '⌥ Option + H';
+    } else {
+      shortcut = 'Alt + H';
+    }
+    logoTooltip.textContent = `Open AIG Lite (${shortcut})`;
+    Object.assign(logoTooltip.style, {
+      position: 'fixed',
+      background: '#18181b',
+      color: '#fff',
+      padding: '6px 14px',
+      borderRadius: '7px',
+      fontSize: '12px',
+      fontWeight: '500',
+      zIndex: 10001,
+      pointerEvents: 'none',
+      boxShadow: '0 2px 10px rgba(0,0,0,0.18)',
+      whiteSpace: 'nowrap',
+      opacity: '0.97',
+      transition: 'opacity 0.2s',
+      left: '0px',
+      top: '0px',
+    });
+    document.body.appendChild(logoTooltip);
+    // Position above the button, centered
+    const btnRect = logoBtn.getBoundingClientRect();
+    const ttRect = logoTooltip.getBoundingClientRect();
+    logoTooltip.style.left = `${btnRect.left + (btnRect.width - ttRect.width) / 2}px`;
+    logoTooltip.style.top = `${btnRect.top - ttRect.height - 8}px`;
+  });
+  logoBtn.addEventListener('mouseleave', () => {
+    if (logoTooltip) {
+      logoTooltip.remove();
+      logoTooltip = null;
+    }
+  });
+
+  logoBtn.onclick = () => {
+    // Clean up tooltip before removing toolbar
+    if (logoTooltip) {
+      logoTooltip.remove();
+      logoTooltip = null;
+    }
+
+    // Close dropdown if it's open
+    if (disableDropdown && disableDropdown.style.display === 'block') {
+      disableDropdown.style.display = 'none';
+    }
+
+    // Clean up disable tooltip if present
+    if (disableTooltip) {
+      disableTooltip.remove();
+      disableTooltip = null;
+    }
+
+    if (isChromeApiAvailable()) {
+      try {
+        chrome.runtime.sendMessage({
+          type: 'open_side_panel',
+          directUserAction: true,
+          source: 'toolbar_logo',
+        });
+      } catch (error) {
+        console.warn('AIG Lite: Error sending message to open side panel:', error);
+      }
+    } else {
+      console.warn('AIG Lite: Chrome APIs not available, cannot open side panel');
+    }
+    removeFloatingButton();
+  };
+  container.appendChild(logoBtn);
+
+  // --- Copy Button ---
+  const copyBtn = document.createElement('button');
+  copyBtn.style.display = 'flex';
+  copyBtn.style.alignItems = 'center';
+  copyBtn.style.justifyContent = 'center';
+  copyBtn.style.width = '32px';
+  copyBtn.style.height = '32px';
+  copyBtn.style.minWidth = '32px';
+  copyBtn.style.minHeight = '32px';
+  copyBtn.style.border = 'none';
+  copyBtn.style.background = 'transparent';
+  copyBtn.style.borderRadius = '8px';
+  copyBtn.style.cursor = 'pointer';
+  copyBtn.style.transition = 'background 0.15s';
+  copyBtn.onmouseover = () => (copyBtn.style.background = '#f3f3f3');
+  copyBtn.onmouseout = () => (copyBtn.style.background = 'transparent');
+  copyBtn.innerHTML = `
+    <svg width="16" height="16" viewBox="0 0 20 20" fill="none">
+      <rect x="6" y="6" width="9" height="9" rx="2" stroke="#222" stroke-width="1.3" fill="none"/>
+      <rect x="3" y="3" width="9" height="9" rx="2" stroke="#888" stroke-width="1" fill="none"/>
+    </svg>
+  `;
+  
+  // Custom tooltip for Copy
+  let copyTooltip;
+  copyBtn.addEventListener('mouseenter', () => {
+    copyTooltip = document.createElement('div');
+    copyTooltip.textContent = 'Copy';
+    Object.assign(copyTooltip.style, {
+      position: 'fixed',
+      background: '#18181b',
+      color: '#fff',
+      padding: '6px 14px',
+      borderRadius: '7px',
+      fontSize: '12px',
+      fontWeight: '500',
+      zIndex: 10001,
+      pointerEvents: 'none',
+      boxShadow: '0 2px 10px rgba(0,0,0,0.18)',
+      whiteSpace: 'nowrap',
+      opacity: '0.97',
+      transition: 'opacity 0.2s',
+      left: '0px',
+      top: '0px',
+    });
+    document.body.appendChild(copyTooltip);
+    // Position above the button, centered
+    const btnRect = copyBtn.getBoundingClientRect();
+    const ttRect = copyTooltip.getBoundingClientRect();
+    copyTooltip.style.left = `${btnRect.left + (btnRect.width - ttRect.width) / 2}px`;
+    copyTooltip.style.top = `${btnRect.top - ttRect.height - 8}px`;
+  });
+  copyBtn.addEventListener('mouseleave', () => {
+    if (copyTooltip) {
+      copyTooltip.remove();
+      copyTooltip = null;
+    }
+  });
+
+  copyBtn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(selectedText);
+      copyBtn.style.background = '#e0ffe0';
+      setTimeout(() => (copyBtn.style.background = 'transparent'), 600);
+    } catch (e) {
+      copyBtn.style.background = '#ffe0e0';
+      setTimeout(() => (copyBtn.style.background = 'transparent'), 600);
+    }
+  };
+  container.appendChild(copyBtn);
+
+  // --- Explain Button ---
+  const explainBtn = document.createElement('button');
+  explainBtn.style.display = 'flex';
+  explainBtn.style.alignItems = 'center';
+  explainBtn.style.justifyContent = 'center';
+  explainBtn.style.width = '32px';
+  explainBtn.style.height = '32px';
+  explainBtn.style.border = 'none';
+  explainBtn.style.background = 'transparent';
+  explainBtn.style.borderRadius = '8px';
+  explainBtn.style.cursor = 'pointer';
+  explainBtn.style.transition = 'background 0.15s';
+  explainBtn.onmouseover = () => (explainBtn.style.background = '#f3f3f3');
+  explainBtn.onmouseout = () => (explainBtn.style.background = 'transparent');
+  explainBtn.innerHTML = `
+    <svg width="18" height="18" viewBox="0 0 20 20" fill="none">
+      <rect x="4" y="4" width="12" height="12" rx="3" stroke="#222" stroke-width="1.5" fill="none"/>
+      <path d="M7 9.5h6M7 12h4" stroke="#222" stroke-width="1.3" stroke-linecap="round"/>
+    </svg>
+  `;
+
+  // Custom tooltip for Explain
+  let explainTooltip;
+  explainBtn.addEventListener('mouseenter', () => {
+    explainTooltip = document.createElement('div');
+    explainTooltip.textContent = 'Explain';
+    Object.assign(explainTooltip.style, {
+      position: 'fixed',
+      background: '#18181b',
+      color: '#fff',
+      padding: '6px 14px',
+      borderRadius: '7px',
+      fontSize: '12px',
+      fontWeight: '500',
+      zIndex: 10001,
+      pointerEvents: 'none',
+      boxShadow: '0 2px 10px rgba(0,0,0,0.18)',
+      whiteSpace: 'nowrap',
+      opacity: '0.97',
+      transition: 'opacity 0.2s',
+      left: '0px',
+      top: '0px',
+    });
+    document.body.appendChild(explainTooltip);
+    // Position above the button, centered
+    const btnRect = explainBtn.getBoundingClientRect();
+    const ttRect = explainTooltip.getBoundingClientRect();
+    explainTooltip.style.left = `${btnRect.left + (btnRect.width - ttRect.width) / 2}px`;
+    explainTooltip.style.top = `${btnRect.top - ttRect.height - 8}px`;
+  });
+  explainBtn.addEventListener('mouseleave', () => {
+    if (explainTooltip) {
+      explainTooltip.remove();
+      explainTooltip = null;
+    }
+  });
+
+  explainBtn.onclick = async () => {
+    // Check if Chrome APIs are available first
+    if (!isChromeApiAvailable()) {
+      console.warn('AIG Lite: Chrome APIs not available, cannot use explain functionality');
+      return;
+    }
+
+    // Handle explain functionality
+    try {
+      const result = await new Promise((resolve) => {
+        chrome.storage.local.get(['session'], (result) => {
+          if (chrome.runtime.lastError) {
+            console.warn('AIG Lite: Chrome storage error:', chrome.runtime.lastError);
+            resolve({});
+            return;
+          }
+          resolve(result);
+        });
+      });
+
+      if (!result.session || !result.session.username) {
+        try {
+          chrome.runtime.sendMessage({
+            type: 'open_side_panel',
+            directUserAction: true,
+            source: 'explain_this',
+          });
+        } catch (error) {
+          console.warn('AIG Lite: Error sending message to open side panel:', error);
+        }
+        return;
+      }
+      const username = result.session.username;
+      const invalidUsernames = ['anonymous', 'null', 'undefined', ''];
+      const isValidUsername = !invalidUsernames.includes(username.toLowerCase().trim());
+      if (!isValidUsername) {
+        try {
+          chrome.runtime.sendMessage({
+            type: 'open_side_panel',
+            directUserAction: true,
+            source: 'explain_this',
+          });
+        } catch (error) {
+          console.warn('AIG Lite: Error sending message to open side panel:', error);
+        }
+        return;
+      }
+    } catch (error) {
+      console.warn('AIG Lite: Error checking session:', error);
+      try {
+        chrome.runtime.sendMessage({
+          type: 'open_side_panel',
+          directUserAction: true,
+          source: 'explain_this',
+        });
+      } catch (msgError) {
+        console.warn('AIG Lite: Error sending message to open side panel:', msgError);
+      }
+      return;
+    }
+
+    // Gather context for the selected text
+    const pageTitle = document.title;
+    const pageUrl = window.location.href;
+    let pageContent = '';
+    try {
+      const { content } = processArticle(document);
+      pageContent = content;
+    } catch (e) {
+      pageContent = document.body.innerText;
+    }
+
+    const textData = {
+      message: `Explain this text in the context of the current page:\n\n${selectedText}`,
+      pageContent,
+      pageUrl,
+      pageTitle,
+      timestamp: Date.now(),
+      originalText: selectedText,
+    };
+
+    try {
+      chrome.storage.local.set({ selectedTextExplanation: textData }, async () => {
+        if (chrome.runtime.lastError) {
+          console.warn('AIG Lite: Error saving text data:', chrome.runtime.lastError);
+        }
+        
+        try {
+          const response = await chrome.runtime.sendMessage({
+            type: 'open_side_panel',
+            data: textData,
+            directUserAction: true,
+            source: 'explain_this',
+          });
+          if (response && response.success) return;
+        } catch (err) {
+          console.warn('AIG Lite: Error sending message to open side panel:', err);
+        }
+        
+        // fallback: show tooltip
+        const tooltip = document.createElement('div');
+        tooltip.textContent = 'Text saved! Use the extension icon or context menu to open side panel.';
+        tooltip.style.cssText = `
+          position: fixed;
+          top: ${window.scrollY + 10}px;
+          left: 50%;
+          transform: translateX(-50%);
+          background: #333;
+          color: white;
+          padding: 12px 16px;
+          border-radius: 6px;
+          font-size: 14px;
+          z-index: 10000;
+          box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+          max-width: 300px;
+          width: auto;
+        `;
+        document.body.appendChild(tooltip);
+        setTimeout(() => {
+          tooltip.style.opacity = '0';
+          tooltip.style.transition = 'opacity 0.8s';
+          setTimeout(() => tooltip.remove(), 800);
+        }, 8000);
+        
+        try {
+          chrome.runtime.sendMessage({
+            action: 'contextTextSelected',
+            forSelectedText: selectedText,
+          });
+        } catch (error) {
+          console.warn('AIG Lite: Error sending context message:', error);
+        }
+      });
+    } catch (error) {
+      console.warn('AIG Lite: Error accessing chrome storage for text data:', error);
+    }
+  };
+  container.appendChild(explainBtn);
+
+  // --- X Button (Dropdown for disable options) ---
+  const xBtn = document.createElement('button');
+  xBtn.setAttribute('aria-label', 'options');
+  xBtn.style.display = 'flex';
+  xBtn.style.alignItems = 'center';
+  xBtn.style.justifyContent = 'center';
+  xBtn.style.width = '32px';
+  xBtn.style.height = '32px';
+  xBtn.style.minWidth = '32px';
+  xBtn.style.minHeight = '32px';
+  xBtn.style.border = 'none';
+  xBtn.style.background = 'transparent';
+  xBtn.style.borderRadius = '8px';
+  xBtn.style.cursor = 'pointer';
+  xBtn.style.transition = 'background 0.15s';
+  xBtn.onmouseover = () => (xBtn.style.background = '#f3f3f3');
+  xBtn.onmouseout = () => (xBtn.style.background = 'transparent');
+  xBtn.innerHTML = `
+    <svg width="16" height="16" viewBox="0 0 20 20" fill="none">
+      <circle cx="10" cy="4" r="1.5" fill="#888"/>
+      <circle cx="10" cy="10" r="1.5" fill="#888"/>
+      <circle cx="10" cy="16" r="1.5" fill="#888"/>
+    </svg>
+  `;
+  
+  // Dropdown for disable options (define first)
+  const disableDropdown = document.createElement('div');
+  Object.assign(disableDropdown.style, {
+    position: 'fixed',
+    minWidth: '170px',
+    background: 'white',
+    border: '1px solid #e0e0e0',
+    borderRadius: '8px',
+    boxShadow: '0 4px 16px rgba(0,0,0,0.13)',
+    padding: '6px 0',
+    fontSize: '14px',
+    zIndex: 10001,
+    display: 'none',
+    left: '0px',
+    top: '0px',
+  });
+
+  function addDropdownItem(label, onClick) {
+    const item = document.createElement('div');
+    item.textContent = label;
+    item.style.padding = '8px 18px';
+    item.style.cursor = 'pointer';
+    item.style.color = '#222';
+    item.style.background = 'white';
+    item.onmouseover = () => (item.style.background = '#f3f3f3');
+    item.onmouseout = () => (item.style.background = 'white');
+    item.onclick = () => {
+      disableDropdown.style.display = 'none';
+      if (disableTooltip) {
+        disableTooltip.remove();
+        disableTooltip = null;
+      }
+      onClick();
+    };
+    disableDropdown.appendChild(item);
+  }
+
+  addDropdownItem('Disable on this site', () => {
+    if (!isChromeApiAvailable()) {
+      console.warn('AIG Lite: Chrome APIs not available, cannot disable on this site');
+      removeFloatingButton();
+      return;
+    }
+    
+    const domain = window.location.hostname.replace(/^www\./, '');
+    try {
+      // Double-check Chrome API availability before each call
+      if (!chrome || !chrome.storage || !chrome.storage.local) {
+        console.warn('AIG Lite: Chrome storage not available');
+        removeFloatingButton();
+        return;
+      }
+      
+      chrome.storage.local.get(['aiglite_toolbar_disabled_sites'], (result) => {
+        if (chrome.runtime.lastError) {
+          console.warn('AIG Lite: Chrome storage error:', chrome.runtime.lastError);
+          removeFloatingButton();
+          return;
+        }
+        
+        const disabled = result.aiglite_toolbar_disabled_sites || [];
+        if (!disabled.includes(domain)) {
+          disabled.push(domain);
+          try {
+            // Double-check before set call
+            if (!chrome || !chrome.storage || !chrome.storage.local) {
+              console.warn('AIG Lite: Chrome storage not available for set operation');
+              removeFloatingButton();
+              return;
+            }
+            chrome.storage.local.set({ aiglite_toolbar_disabled_sites: disabled }, () => {
+              if (chrome.runtime.lastError) {
+                console.warn('AIG Lite: Chrome storage error:', chrome.runtime.lastError);
+              } else {
+                // Log successful disable action
+                logToolbarEvent('toolbar_disabled_site', { domain });
+                // Show notification about options page
+                showOptionsPageNotification(`Context menu disabled on ${domain}.`);
+              }
+              removeFloatingButton();
+            });
+          } catch (setError) {
+            console.warn('AIG Lite: Error setting chrome storage:', setError);
+            removeFloatingButton();
+          }
+        } else {
+          removeFloatingButton();
+        }
+      });
+    } catch (error) {
+      console.warn('AIG Lite: Error accessing chrome storage:', error);
+      removeFloatingButton();
+    }
+  });
+
+  addDropdownItem('Disable everywhere', () => {
+    if (!isChromeApiAvailable()) {
+      console.warn('AIG Lite: Chrome APIs not available, cannot disable everywhere');
+      removeFloatingButton();
+      return;
+    }
+    
+    try {
+      // Double-check Chrome API availability before each call
+      if (!chrome || !chrome.storage || !chrome.storage.local) {
+        console.warn('AIG Lite: Chrome storage not available');
+        removeFloatingButton();
+        return;
+      }
+      
+      chrome.storage.local.set({ aiglite_toolbar_disabled_all: true }, () => {
+        if (chrome.runtime.lastError) {
+          console.warn('AIG Lite: Chrome storage error:', chrome.runtime.lastError);
+        } else {
+          // Log successful disable action
+          logToolbarEvent('toolbar_disabled_all');
+          // Show notification about options page
+          showOptionsPageNotification('Context menu disabled on all sites.');
+        }
+        removeFloatingButton();
+      });
+    } catch (error) {
+      console.warn('AIG Lite: Error accessing chrome storage:', error);
+      removeFloatingButton();
+    }
+  });
+
+  addDropdownItem('Disable this time', () => {
+    try {
+      sessionStorage.setItem('aiglite_toolbar_disabled_once', '1');
+      // Log successful disable action
+      logToolbarEvent('toolbar_disabled_once');
+    } catch (error) {
+      console.warn('AIG Lite: SessionStorage not available:', error);
+    }
+    removeFloatingButton();
+  });
+
+  addDropdownItem('Close', () => {
+    // Just hide the dropdown - don't remove the toolbar
+    disableDropdown.style.display = 'none';
+    
+    // Remove tooltip if present
+    if (disableTooltip) {
+      disableTooltip.remove();
+      disableTooltip = null;
+    }
+  });
+
+  // Tooltip for Disable (after dropdown is defined)
+  let disableTooltip;
+  xBtn.addEventListener('mouseenter', () => {
+    if (disableDropdown.style.display === 'block') return;
+    disableTooltip = document.createElement('div');
+    disableTooltip.textContent = 'Options';
+    Object.assign(disableTooltip.style, {
+      position: 'fixed',
+      background: '#18181b',
+      color: '#fff',
+      padding: '6px 14px',
+      borderRadius: '7px',
+      fontSize: '12px',
+      fontWeight: '500',
+      zIndex: 10001,
+      pointerEvents: 'none',
+      boxShadow: '0 2px 10px rgba(0,0,0,0.18)',
+      whiteSpace: 'nowrap',
+      opacity: '0.97',
+      transition: 'opacity 0.2s',
+      left: '0px',
+      top: '0px',
+    });
+    document.body.appendChild(disableTooltip);
+    // Position above the button, centered
+    const btnRect = xBtn.getBoundingClientRect();
+    const ttRect = disableTooltip.getBoundingClientRect();
+    disableTooltip.style.left = `${btnRect.left + (btnRect.width - ttRect.width) / 2}px`;
+    disableTooltip.style.top = `${btnRect.top - ttRect.height - 8}px`;
+  });
+  xBtn.addEventListener('mouseleave', () => {
+    if (disableTooltip) {
+      disableTooltip.remove();
+      disableTooltip = null;
+    }
+  });
+
+  xBtn.onclick = (e) => {
+    e.stopPropagation();
+    e.preventDefault(); // Prevent any default actions
+
+    // Remove tooltip if present
+    if (disableTooltip) {
+      disableTooltip.remove();
+      disableTooltip = null;
+    }
+
+    // Toggle: If dropdown is already showing, hide it
+    if (disableDropdown.style.display === 'block') {
+      disableDropdown.style.display = 'none';
+      return;
+    }
+
+    // Show dropdown below the X button
+    const btnRect = xBtn.getBoundingClientRect();
+    disableDropdown.style.left = `${btnRect.left + (btnRect.width - 170) / 2}px`;
+    disableDropdown.style.top = `${btnRect.bottom + 6}px`;
+    disableDropdown.style.display = 'block';
+
+    // Handle outside clicks with improved event handling
+    const handleOutsideClick = (ev) => {
+      // Ensure we're not handling the same click that opened the dropdown
+      if (ev.target === xBtn || ev.target.closest('#aig-lite-toolbar') === container) {
+        return;
+      }
+
+      // Don't close if clicking the dropdown itself
+      if (disableDropdown.contains(ev.target)) {
+        return;
+      }
+
+      // Close the dropdown and remove listener
+      disableDropdown.style.display = 'none';
+      document.removeEventListener('mousedown', handleOutsideClick, true);
+    };
+
+    // Add listener after the current event has completely finished
+    // Use requestAnimationFrame to ensure we're in the next frame
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        document.addEventListener('mousedown', handleOutsideClick, true);
+      }, 50);
+    });
+  };
+
+  // Prevent dropdown from closing when clicking inside
+  disableDropdown.addEventListener('mousedown', (e) => {
+    e.stopPropagation();
+  });
+
+  // Ensure dropdown is appended to body for correct z-index and positioning
+  if (!document.body.contains(disableDropdown)) {
+    document.body.appendChild(disableDropdown);
+  }
+  container.appendChild(xBtn);
+
+  // --- Responsive positioning: prevent off-screen ---
+  document.body.appendChild(container);
+  setTimeout(() => {
+    const toolbarRect = container.getBoundingClientRect();
+    let newLeft = rect.left + window.scrollX;
+    let newTop = rect.top + window.scrollY - toolbarRect.height - 8;
+    if (newLeft + toolbarRect.width > window.innerWidth - 8) {
+      newLeft = window.innerWidth - toolbarRect.width - 8;
+    }
+    if (newLeft < 8) newLeft = 8;
+    if (newTop < 8) newTop = rect.bottom + window.scrollY + 8;
+    container.style.left = `${newLeft - 20}px`;
+    container.style.top = `${newTop + 20}px`;
+  }, 0);
+
+  // --- Add fade-in animation ---
+  if (!document.getElementById('aig-lite-toolbar-styles')) {
+    const style = document.createElement('style');
+    style.id = 'aig-lite-toolbar-styles';
+    style.textContent = `
+      #aig-lite-toolbar {
+        animation: fadeInToolbar 0.22s cubic-bezier(.4,0,.2,1);
+      }
+      @keyframes fadeInToolbar {
+        from { opacity: 0; transform: translateY(-10px);}
+        to { opacity: 1; transform: translateY(0);}
+      }
+      #aig-lite-toolbar button:active { background: #eaeaea !important; }
+    `;
+    document.head.appendChild(style);
+  }
+}
+
+// Multi-domain upload error detection and AIG Lite suggestion system
+
+function getCurrentDomain() {
+  const hostname = window.location.hostname;
+  if (hostname.includes('claude.ai')) return 'claude.ai';
+  if (hostname.includes('chatgpt.com')) return 'chatgpt.com';
+  return null;
+}
+
+function findUploadButton(domain) {
+  // Claude.ai: Find the plus button that opens the attachment menu
+  if (domain === 'claude.ai') {
+    // First try to find by ID (most reliable)
+    let plusButton = document.getElementById('input-plus-menu-trigger');
+    if (plusButton) {
+      return plusButton;
+    }
+
+    // Fallback: find by test ID
+    plusButton = document.querySelector('[data-testid="input-menu-plus"]');
+    if (plusButton) {
+      return plusButton;
+    }
+
+    // Fallback: find by aria-label
+    plusButton = document.querySelector('button[aria-label="Open attachments menu"]');
+    if (plusButton) {
+      return plusButton;
+    }
+
+    // Last fallback: look for button with plus SVG
+    const buttons = document.querySelectorAll('button');
+    for (const btn of buttons) {
+      const svg = btn.querySelector('svg');
+      if (
+        svg &&
+        svg.querySelector(
+          'path[d*="M224,128a8,8,0,0,1-8,8H136v80a8,8,0,0,1-16,0V136H40a8,8,0,0,1,0-16h80V40a8,8,0,0,1,16,0v80h80A8,8,0,0,1,224,128Z"]'
+        )
+      ) {
+        return btn;
+      }
+    }
+  }
+
+  // ChatGPT: Find the upload file button
+  if (domain === 'chatgpt.com') {
+    // First try to find by ID (most reliable)
+    let uploadButton = document.getElementById('upload-file-btn');
+    if (uploadButton) {
+      return uploadButton;
+    }
+
+    // Fallback: find by aria-label containing "Add files"
+    uploadButton = document.querySelector('button[aria-label*="Add files"]');
+    if (uploadButton) {
+      return uploadButton;
+    }
+
+    // Fallback: find by class
+    uploadButton = document.querySelector('button.composer-btn');
+    if (uploadButton) {
+      return uploadButton;
+    }
+
+    // Last fallback: look for button with plus SVG (ChatGPT style)
+    const buttons = document.querySelectorAll('button');
+    for (const btn of buttons) {
+      const svg = btn.querySelector('svg');
+      if (
+        svg &&
+        svg.querySelector(
+          'path[d*="M12 3C12.5523 3 13 3.44772 13 4L13 11H20C20.5523 11 21 11.4477 21 12"]'
+        )
+      ) {
+        return btn;
+      }
+    }
+  }
+  return null;
+}
+
+function checkForUploadErrors(domain) {
+  // Claude.ai: Simple toast notification detection
+  if (domain === 'claude.ai') {
+    // Look for the notifications region with toast items
+    const notifRegion = document.querySelector(
+      'div[role="region"][aria-label="Notifications (F8)"]'
+    );
+    if (notifRegion) {
+      const toastList = notifRegion.querySelector('ol.fixed.right-0.top-0.z-toast');
+      if (toastList) {
+        const toastItems = toastList.querySelectorAll('li[role="status"]');
+
+        // No toasts found, so no errors currently showing
+        if (toastItems.length === 0) {
+          lastDetectedToastId = null;
+          return false;
+        }
+
+        // Check if any toast contains the error text
+        for (const toast of toastItems) {
+          const toastText = toast.textContent || '';
+          if (toastText.includes('Text extraction failed')) {
+            // Generate a unique ID for this toast based on its content
+            const toastId = btoa(toastText.slice(0, 30));
+
+            // If this is the same toast we already detected, don't trigger again
+            if (toastId === lastDetectedToastId) {
+              return false;
+            }
+
+            // Remember this toast so we don't trigger multiple times
+            lastDetectedToastId = toastId;
+            return true;
+          }
+        }
+
+        // No matching toast found
+        lastDetectedToastId = null;
+        return false;
+      }
+    }
+  }
+
+  // ChatGPT: Look for error banner/alert
+  if (domain === 'chatgpt.com') {
+    // Similar approach for ChatGPT error detection
+    const errorContainers = document.querySelectorAll(
+      'div[role="alert"], .error, .alert, [class*="error"], [class*="alert"]'
+    );
+
+    // No error containers found
+    if (errorContainers.length === 0) {
+      lastDetectedToastId = null;
+      return false;
+    }
+
+    for (const container of errorContainers) {
+      const errorText = container.textContent || '';
+
+      // Check for ChatGPT-specific error messages
+      if (
+        errorText.includes('Failed upload to files.oaiusercontent.com') ||
+        errorText.includes('Please ensure your network settings allow access') ||
+        errorText.includes('contact your network administrator') ||
+        errorText.includes('upload failed')
+      ) {
+        // Generate a unique ID for this error message
+        const errorId = btoa(errorText.slice(0, 30));
+
+        // If this is the same error we already detected, don't trigger again
+        if (errorId === lastDetectedToastId) {
+          return false;
+        }
+
+        // Remember this error so we don't trigger multiple times
+        lastDetectedToastId = errorId;
+        return true;
+      }
+    }
+
+    // Also check for any red-colored divs that might contain error messages
+    const redElements = document.querySelectorAll(
+      'div[style*="color: red"], div[style*="background: red"], div[style*="background-color: red"]'
+    );
+
+    if (redElements.length > 0) {
+      for (const element of redElements) {
+        const text = element.textContent || '';
+        if (
+          text.toLowerCase().includes('failed') ||
+          text.toLowerCase().includes('upload') ||
+          text.toLowerCase().includes('error')
+        ) {
+          // Generate a unique ID for this error message
+          const errorId = btoa(text.slice(0, 30));
+
+          // If this is the same error we already detected, don't trigger again
+          if (errorId === lastDetectedToastId) {
+            return false;
+          }
+
+          // Remember this error so we don't trigger multiple times
+          lastDetectedToastId = errorId;
+          return true;
+        }
+      }
+    }
+
+    // No matching error found
+    lastDetectedToastId = null;
+    return false;
+  }
+
+  return false;
+}
+
+function createAIGLitePopup(domain, uploadButton) {
+  // Remove any existing popup
+  removeAIGLitePopup();
+
+  const popup = document.createElement('div');
+  popup.id = 'aig-lite-upload-suggestion';
+  popup.innerHTML = `
+    <div class="aig-popup-card" style="
+      background: white;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+      padding: 16px;
+      max-width: 320px;
+      font-family: system-ui, -apple-system, sans-serif;
+      position: relative;
+    ">
+      <div class="aig-popup-header" style="
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 12px;
+      ">
+        <img src="${chrome.runtime.getURL('/icon.png')}" 
+             alt="AIG Lite" style="width: 20px; height: 20px;" />
+        <span style="font-weight: 600; color: #374151; font-size: 14px;">
+          File upload blocked by security?
+        </span>
+        <button class="aig-popup-close" style="
+          margin-left: auto;
+          background: none;
+          border: none;
+          font-size: 18px;
+          cursor: pointer;
+          color: #6b7280;
+          padding: 0;
+          width: 20px;
+          height: 20px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        ">×</button>
+      </div>
+      <div class="aig-popup-content">
+        <p style="margin: 0 0 12px 0; color: #6b7280; font-size: 13px; line-height: 1.4;">
+          Try uploading your file through AIG Lite instead!
+        </p>
+        <button class="aig-popup-action" style="
+          background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+          color: white;
+          border: none;
+          border-radius: 8px;
+          padding: 10px 16px;
+          font-weight: 500;
+          cursor: pointer;
+          width: 100%;
+          font-size: 14px;
+          transition: all 0.2s ease;
+        ">
+          Use AIG Lite
+        </button>
+      </div>
+    </div>
+  `;
+
+  // Position the popup
+  positionPopup(popup, uploadButton, domain);
+
+  // Add event listeners
+  popup.querySelector('.aig-popup-close').onclick = () => removeAIGLitePopup();
+  popup.querySelector('.aig-popup-action').onclick = () => {
+    handleAIGLiteClick(domain);
+    removeAIGLitePopup();
+  };
+
+  // Add hover effects
+  const actionButton = popup.querySelector('.aig-popup-action');
+  actionButton.onmouseover = () => {
+    actionButton.style.transform = 'translateY(-1px)';
+    actionButton.style.boxShadow = '0 4px 12px rgba(59, 130, 246, 0.3)';
+  };
+  actionButton.onmouseout = () => {
+    actionButton.style.transform = 'translateY(0)';
+    actionButton.style.boxShadow = 'none';
+  };
+
+  document.body.appendChild(popup);
+
+  // Auto-remove after 15 seconds
+  popupCleanupTimeout = setTimeout(() => {
+    removeAIGLitePopup();
+  }, 15000);
+
+  return popup;
+}
+
+function positionPopup(popup, uploadButton, domain) {
+  const rect = uploadButton.getBoundingClientRect();
+
+  popup.style.position = 'fixed';
+  popup.style.zIndex = '10000';
+
+  if (domain === 'chatgpt.com') {
+    // Position below the upload area for ChatGPT
+    popup.style.top = `${rect.bottom + 12}px`;
+    popup.style.left = `${rect.left}px`;
+  } else if (domain === 'claude.ai') {
+    // Position below the upload button for Claude
+    popup.style.top = `${rect.bottom + 8}px`;
+    popup.style.left = `${rect.left}px`;
+  }
+
+  // Ensure popup doesn't go off screen
+  setTimeout(() => {
+    const popupRect = popup.getBoundingClientRect();
+    if (popupRect.right > window.innerWidth) {
+      popup.style.left = `${window.innerWidth - popupRect.width - 20}px`;
+    }
+    if (popupRect.bottom > window.innerHeight) {
+      popup.style.top = `${rect.top - popupRect.height - 8}px`;
+    }
+  }, 0);
+}
+
+function removeAIGLitePopup() {
+  const existingPopup = document.getElementById('aig-lite-upload-suggestion');
+  if (existingPopup) {
+    existingPopup.remove();
+  }
+  if (popupCleanupTimeout) {
+    clearTimeout(popupCleanupTimeout);
+    popupCleanupTimeout = null;
+  }
+  aigLitePopupShown = false;
+}
+
+function handleAIGLiteClick(domain) {
+  // Just open the side panel without storing any message context
+  // This will open AIG Lite without auto-posting any message
+  if (!isChromeApiAvailable()) {
+    console.warn('AIG Lite: Chrome APIs not available, cannot open side panel');
+    return;
+  }
+  
+  try {
+    // Double-check Chrome runtime availability
+    if (!chrome || !chrome.runtime || !chrome.runtime.sendMessage) {
+      console.warn('AIG Lite: Chrome runtime not available');
+      return;
+    }
+    
+    chrome.runtime.sendMessage({
+      type: 'open_side_panel',
+      directUserAction: true,
+      source: 'use_aig_lite',
+      domain: domain,
+    });
+  } catch (error) {
+    console.warn('AIG Lite: Error sending message to open side panel:', error);
+  }
+}
+
+function setupErrorObserver(domain) {
+  const config = DOMAIN_CONFIGS[domain];
+  if (!config) return;
+
+  // Set up observer for error toasts
+  const observer = new MutationObserver((mutations) => {
+    let errorNowPresent = false;
+
+    // Check each mutation for added nodes that might be error messages
+    for (const mutation of mutations) {
+      if (mutation.type === 'childList') {
+        // Check if an error is now present - only if we have added nodes (toast appeared)
+        if (mutation.addedNodes.length > 0 && checkForUploadErrors(domain)) {
+          errorNowPresent = true;
+        }
+      }
+    }
+
+    // Only show the popup if an error was just detected
+    if (errorNowPresent) {
+      const uploadButton = findUploadButton(domain);
+      if (uploadButton && !document.getElementById('aig-lite-upload-suggestion')) {
+        aigLitePopupShown = true;
+        createAIGLitePopup(domain, uploadButton);
+      }
+    }
+  });
+
+  // Rest of the observer setup remains the same...
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    characterData: true,
+  });
+
+  // Also set up a special observer just for the notifications area if we can find it
+  const notificationsArea = document.querySelector(
+    'div[role="region"][aria-label="Notifications (F8)"]'
+  );
+  if (notificationsArea) {
+    const notificationObserver = new MutationObserver((mutations) => {
+      let errorDetected = false;
+      for (const mutation of mutations) {
+        // Only check for errors when nodes are added (toast appeared)
+        if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+          if (checkForUploadErrors(domain)) {
+            errorDetected = true;
+            break;
+          }
+        }
+      }
+
+      if (errorDetected) {
+        const uploadButton = findUploadButton(domain);
+        if (uploadButton && !document.getElementById('aig-lite-upload-suggestion')) {
+          aigLitePopupShown = true;
+          createAIGLitePopup(domain, uploadButton);
+        }
+      }
+    });
+
+    notificationObserver.observe(notificationsArea, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      characterData: true,
+    });
+  }
+
+  return observer;
+}
+
+// Manual testing function - can be called from console: window.testAIGLitePopup()
+window.testAIGLitePopup = function () {
+  const domain = getCurrentDomain();
+  if (!domain) {
+    console.error('AIG Lite: Not on a supported domain');
+    return false;
+  }
+
+  const uploadButton = findUploadButton(domain);
+  if (!uploadButton) {
+    console.error('AIG Lite: Upload button not found');
+    return false;
+  }
+
+  console.log('AIG Lite: Manually triggering popup');
+  createAIGLitePopup(domain, uploadButton);
+  return true;
+};
+
+// Enable debug mode by default for troubleshooting
+window.AIG_LITE_DEBUG = true;
+
+// Initialize upload error detection for supported domains
+(function initUploadErrorDetection() {
+  const domain = getCurrentDomain();
+  if (domain) {
+    // Set up error monitoring
+    setupErrorObserver(domain);
+
+    // Function to set up button monitoring with retry
+    const setupButtonMonitoring = (retryCount = 0) => {
+      const uploadButton = findUploadButton(domain);
+      if (uploadButton) {
+        monitorUploadButtonClicks(domain);
+      } else if (retryCount < 10) {
+        setTimeout(() => setupButtonMonitoring(retryCount + 1), 1000);
+      }
+    };
+
+    // Start button monitoring with retry
+    setupButtonMonitoring();
+
+    // Periodic check for upload buttons (in case they're dynamically added)
+    setInterval(() => {
+      monitorUploadButtonClicks(domain);
+    }, 5000);
+
+    // Also do an immediate check for existing errors on page load
+    setTimeout(() => {
+      if (checkForUploadErrors(domain)) {
+        const uploadButton = findUploadButton(domain);
+        if (uploadButton && !document.getElementById('aig-lite-upload-suggestion')) {
+          aigLitePopupShown = true;
+          createAIGLitePopup(domain, uploadButton);
+        }
+      }
+    }, 2000);
+  }
+})();
+
+function shouldShowToolbar() {
+  // Check chrome.storage and sessionStorage for disable flags
+  return new Promise((resolve) => {
+    // Check if Chrome APIs are available
+    if (!isChromeApiAvailable()) {
+      console.warn('AIG Lite: Chrome APIs not available, defaulting to show toolbar');
+      // Still check sessionStorage if available
+      try {
+        if (sessionStorage.getItem('aiglite_toolbar_disabled_once') === '1') {
+          resolve(false);
+          return;
+        }
+      } catch (error) {
+        console.warn('AIG Lite: SessionStorage not available:', error);
+      }
+      resolve(true); // Default to showing toolbar if we can't check settings
+      return;
+    }
+    
+    try {
+      chrome.storage.local.get(['aiglite_toolbar_disabled_sites', 'aiglite_toolbar_disabled_all'], (result) => {
+        // Handle chrome.runtime.lastError
+        if (chrome.runtime.lastError) {
+          console.warn('AIG Lite: Chrome storage error:', chrome.runtime.lastError);
+          resolve(true); // Default to showing toolbar
+          return;
+        }
+        
+        const disabledSites = result.aiglite_toolbar_disabled_sites || [];
+        const disabledAll = !!result.aiglite_toolbar_disabled_all;
+        const domain = window.location.hostname.replace(/^www\./, '');
+        
+        if (disabledAll) {
+          // Log when toolbar is hidden due to global disable
+          logToolbarEvent('toolbar_hidden_all');
+          return resolve(false);
+        }
+        
+        if (disabledSites.includes(domain)) {
+          // Log when toolbar is hidden due to site-specific disable
+          logToolbarEvent('toolbar_hidden_site', { domain });
+          return resolve(false);
+        }
+        
+        // Check sessionStorage with error handling
+        try {
+          if (sessionStorage.getItem('aiglite_toolbar_disabled_once') === '1') {
+            // Log when toolbar is hidden due to temporary disable
+            logToolbarEvent('toolbar_hidden_once');
+            return resolve(false);
+          }
+        } catch (error) {
+          console.warn('AIG Lite: SessionStorage not available:', error);
+        }
+        
+        resolve(true);
+      });
+    } catch (error) {
+      console.warn('AIG Lite: Error accessing chrome storage:', error);
+      resolve(true); // Default to showing toolbar
+    }
+  });
+}
+
+// Add event listener for text selection
+document.addEventListener('mouseup', (event) => {
+  setTimeout(async () => {
+    // Ignore clicks that originate from within the toolbar itself
+    if (event.target && event.target.closest('#aig-lite-toolbar')) {
+      return; // Don't process mouseup events from toolbar clicks
+    }
+    
+    const selection = window.getSelection();
+    const selectedText = selection?.toString().trim(); 
+    if (selectedText) {
+      const rect = selection.getRangeAt(0).getBoundingClientRect();
+      if (await shouldShowToolbar()) {
+        showFloatingDot(rect, selectedText);
+      } else {
+        removeFloatingButton();
+        removeFloatingDot();
+      }
+    } else {
+      removeFloatingButton();
+      removeFloatingDot();
+    }
+  }, 10); // Allow selection to register
+});
+
+chrome.runtime.onMessage.addListener(async function (request, sender, sendResponse) {
+  if (request.action === 'extract') {
+    try {
+      const { pageId } = getPageInfo();
+      // Check if the current URL matches the SharePoint site
+      if (
+        window.location.href.startsWith('https://paypal-my.sharepoint.com/') &&
+        window.location.href.includes('stream.aspx')
+      ) {
+        console.log('Using SharePoint extraction logic');
+
+        sendResponse({
+          text: formatTranscriptDataWithTimestamps(state.transcriptData),
+          id: pageId,
+        });
+
+        // Return true here to indicate that the response will be sent asynchronously
+        return true;
+      } else {
+        const { content, metadata } = processArticle(document);
+
+        console.log('Using default extraction logic');
+        // extractedText = document.body.innerText;
+        sendResponse({ text: `content: ${content} metaData: ${metadata}`, id: pageId });
+      }
+    } catch (error) {
+      console.error('Error in content script:', error);
+
+      // Send extraction failure to background script for server logging
+      chrome.runtime.sendMessage({
+        action: 'logToService',
+        logData: {
+          event: 'content_extract_failure',
+          url: window.location.href,
+          title: document.title,
+          error: error.message,
+        },
+      });
+
+      sendResponse({ error: error.message });
+    }
+  } else if (request.action === 'transcriptDataReceived') {
+    // Handle the transcript data here
+
+    try {
+      updateTranscriptData(request.data);
+      updateTranscriptId(request.transcriptId);
+      sendResponse({ text: formatTranscriptDataWithTimestamps(request.data) });
+    } catch (error) {
+      console.error('Error extracting selected text:', error);
+      sendResponse({ error: error.message });
+    }
+  } else if (request.action === 'refreshContent') {
+    const { pageId } = getPageInfo();
+
+    const someData = `This is the refreshed data ${pageId}`;
+
+    // Send the success response and data
+    sendResponse({ success: true, refreshedData: someData });
+  } else if (request.action === 'contextTextSelected') {
+    // Make sure we update the context menu for the selected text
+    console.log('Context menu updated for selected text');
+  }
+  // Make sure to return true if you want to send a response asynchronously
+  return true;
+});
+
+// Monitor upload button clicks
+function monitorUploadButtonClicks(domain) {
+  const uploadButton = findUploadButton(domain);
+  if (uploadButton) {
+    // Add event listener WITHOUT interfering with original functionality
+    // Use capture phase to detect clicks before they reach the button
+    const clickHandler = () => {
+      aigLitePopupShown = false;
+      removeAIGLitePopup();
+      lastDetectedToastId = null; // Reset toast tracking
+
+      // Set up multiple checks with increasing delays
+      [1000, 1500, 2000, 3000].forEach((delay) => {
+        setTimeout(() => {
+          // Only show popup if a NEW error is detected (will be tracked by checkForUploadErrors)
+          if (checkForUploadErrors(domain)) {
+            const button = findUploadButton(domain);
+            if (button && !document.getElementById('aig-lite-upload-suggestion')) {
+              aigLitePopupShown = true;
+              createAIGLitePopup(domain, button);
+            }
+          }
+        }, delay);
+      });
+    };
+
+    // Remove any existing listener first
+    if (uploadButton._aigLiteHandler) {
+      uploadButton.removeEventListener('click', uploadButton._aigLiteHandler, true);
+    }
+
+    // Add our listener in capture phase (doesn't interfere with original functionality)
+    uploadButton.addEventListener('click', clickHandler, true);
+    uploadButton._aigLiteHandler = clickHandler; // Store reference for cleanup
+  }
+}
